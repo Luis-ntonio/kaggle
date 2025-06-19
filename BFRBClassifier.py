@@ -2,23 +2,35 @@ import torch
 import torch.nn as nn
 from typing import List, Tuple
 
+class AttentionPooling(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x, mask):
+        # x: (B, T, D), mask: (B, T)
+        attn_weights = self.attn(x).squeeze(-1)  # (B, T)
+        attn_weights = attn_weights.masked_fill(mask == 0, -1e9)
+        attn_weights = torch.softmax(attn_weights, dim=1)  # (B, T)
+        pooled = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)  # (B, D)
+        return pooled
+
 class BFRBClassifier(nn.Module):
     def __init__(
         self,
-        input_dim: int       = 37,
+        input_dim: int       = 40,
         cnn_channels: List[int] = [64, 128],
-        lstm_hidden: int     = 128,
-        lstm_layers: int     = 2,
-        dropout: float       = 0.6,
+        rnn_hidden: int     = 128,
+        dropout: float       = 0.5,
         num_bfrb_classes: int = 8,
         demo_dim: int        = 7
     ):
-        """
-        input_dim= 37  (sensores)
-        demo_dim = número de features demográficas (p.ej. 7)
-        """
         super().__init__()
-        # --- CNN Backbone ---
+        # CNN Backbone
         convs = []
         in_ch = input_dim
         for out_ch in cnn_channels:
@@ -31,39 +43,37 @@ class BFRBClassifier(nn.Module):
             in_ch = out_ch
         self.cnn = nn.Sequential(*convs)
 
-        # --- BiLSTM over CNN output ---
-        self.lstm = nn.LSTM(
-            input_size=cnn_channels[-1],
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if lstm_layers > 1 else 0.0
-        )
+        # BiGRU and BiLSTM in parallel
+        self.bigru = nn.GRU(input_size=cnn_channels[-1], hidden_size=rnn_hidden, batch_first=True, bidirectional=True)
+        self.bilstm = nn.LSTM(input_size=cnn_channels[-1], hidden_size=rnn_hidden, batch_first=True, bidirectional=True)
 
-        # --- Shared MLP to get temporal embedding (128) ---
+        # Attention pooling
+        self.attn_pool = AttentionPooling(input_dim=4 * rnn_hidden)
+
+        # Shared MLP
         self.shared_fc = nn.Sequential(
-            nn.Linear(2 * lstm_hidden, 256),
+            nn.Linear(4 * rnn_hidden, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True)
         )
 
-        # --- Fusion layer: concat(embed(128), demo_feat(demo_dim)) → 128 ---
+        # Combine with demo features
         self.combined_fc = nn.Sequential(
             nn.Linear(128 + demo_dim, 128),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout)
         )
 
-        # --- Heads ---
+        # Output heads
         self.target_head = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(64, 1)
         )
+
         self.gesture_head = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(inplace=True),
@@ -71,31 +81,12 @@ class BFRBClassifier(nn.Module):
             nn.Linear(64, num_bfrb_classes)
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        length_mask: torch.Tensor,
-        demo_feat: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        x:          (B, Tmax, 37)
-        length_mask:(B, Tmax) float mask
-        demo_feat:  (B, demo_dim)
-
-        Returns:
-          logit_target: (B,)
-          logit_gesture:(B, num_bfrb_classes)
-        """
+    def forward(self, x: torch.Tensor, length_mask: torch.Tensor, demo_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, Tmax, D = x.shape
-
-        # 1) CNN → (B, C_last, Tcnn)
         x_c = x.permute(0, 2, 1)
-        cnn_out = self.cnn(x_c)
+        cnn_out = self.cnn(x_c).permute(0, 2, 1)  # (B, T', C)
 
-        # 2) Permute back → (B, Tcnn, C_last)
-        cnn_out = cnn_out.permute(0, 2, 1)
-
-        # 3) Recompute mask at Tcnn resolution
+        # Downsample mask
         n_pool = sum(1 for m in self.cnn if isinstance(m, nn.MaxPool1d))
         down = 2 ** n_pool
         new_len = (length_mask.sum(dim=1).long() // down).clamp(min=1)
@@ -104,22 +95,15 @@ class BFRBClassifier(nn.Module):
         for i, nl in enumerate(new_len):
             mask[i, :nl] = 1.0
 
-        # 4) BiLSTM + masked mean‐pool
-        lstm_out, _ = self.lstm(cnn_out)
-        lstm_out = lstm_out * mask.unsqueeze(-1)
-        summed = lstm_out.sum(dim=1)
-        counts = mask.sum(dim=1, keepdim=True) + 1e-6
-        pooled = summed / counts  # (B, 2*lstm_hidden)
+        # RNN paths
+        gru_out, _ = self.bigru(cnn_out)
+        lstm_out, _ = self.bilstm(cnn_out)
+        rnn_combined = torch.cat([gru_out, lstm_out], dim=-1)  # (B, T', 4*rnn_hidden)
 
-        # 5) Shared MLP → embed (B,128)
+        pooled = self.attn_pool(rnn_combined, mask)
         embed = self.shared_fc(pooled)
+        combined = self.combined_fc(torch.cat([embed, demo_feat], dim=1))
 
-        # 6) Fusion con demografía
-        #    demo_feat debe venir de collate_fn como Tensor (B, demo_dim)
-        combined = self.combined_fc(torch.cat([embed, demo_feat], dim=1))  # (B,128)
-
-        # 7) Cabezas
-        logit_target  = self.target_head(combined).squeeze(1)   # (B,)
-        logit_gesture = self.gesture_head(combined)            # (B, num_bfrb_classes)
-
+        logit_target = self.target_head(combined).squeeze(1)
+        logit_gesture = self.gesture_head(combined)
         return logit_target, logit_gesture

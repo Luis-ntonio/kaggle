@@ -39,48 +39,59 @@ def train_model(global_data: str, global_demo: str, train_csv: str, train_demo_c
     global_ = BFRBDataset(global_data, global_demo, imu_stats=None, thm_stats=None, tof_stats=None, is_train=True, global_stats=True)
     #save map and idx for inference run
     map, idx, target, gesture, ids, indexes, _ = global_.get_lists()
-    np.save("./out/bfrb_map.npy", np.array(map))
-    np.save("./out/idx2bfrb.npy", np.array(idx))
-    np.save("./out/target.npy", np.array(target))
-    np.save("./out/gesture.npy", np.array(gesture))
-    np.save("./out/ids.npy", np.array(ids))
+    np.save("./out/GruBil/bfrb_map.npy", np.array(map))
+    np.save("./out/GruBil/idx2bfrb.npy", np.array(idx))
+    np.save("./out/GruBil/target.npy", np.array(target))
+    np.save("./out/GruBil/gesture.npy", np.array(gesture))
+    np.save("./out/GruBil/ids.npy", np.array(ids))
     # Save indexes as a list of arrays using numpy's save with allow_pickle=True
-    np.save("./out/indexes.npy", np.array(indexes, dtype=object), allow_pickle=True)
+    np.save("./out/GruBil/indexes.npy", np.array(indexes, dtype=object), allow_pickle=True)
 
 
     # 2) Compute normalization stats on TRAINING set only
 
     #try loading stats from disk
-    if Path("./out/imu_mean.npy").exists():
-        imu_mean = np.load("./out/imu_mean.npy")
-        imu_std = np.load("./out/imu_std.npy")
-        thm_mean = np.load("./out/thm_mean.npy")
-        thm_std = np.load("./out/thm_std.npy")
-        tof_mean = np.load("./out/tof_mean.npy")
-        tof_std = np.load("./out/tof_std.npy")
+    if Path("./out/GruBil/imu_mean.npy").exists():
+        imu_mean = np.load("./out/GruBil/imu_mean.npy")
+        imu_std = np.load("./out/GruBil/imu_std.npy")
+        thm_std = np.load("./out/GruBil/thm_std.npy")
+        tof_mean = np.load("./out/GruBil/tof_mean.npy")
+        thm_mean = np.load("./out/GruBil/thm_mean.npy")
+        tof_std = np.load("./out/GruBil/tof_std.npy")
+        tof_percentiles = np.load("./out/GruBil/tof_percentiles.npy", allow_pickle=True)
     else:
         train_ds = BFRBDataset(global_data, global_demo, imu_stats=None, thm_stats=None, tof_stats=None, is_train=True)
-        (imu_mean, imu_std), (thm_mean, thm_std), (tof_mean, tof_std) = compute_modality_stats(train_ds, device=device)
-        np.save("./out/imu_mean.npy", imu_mean)
-        np.save("./out/imu_std.npy", imu_std)
-        np.save("./out/thm_mean.npy", thm_mean)
-        np.save("./out/thm_std.npy", thm_std)
-        np.save("./out/tof_mean.npy", tof_mean)
-        np.save("./out/tof_std.npy", tof_std)
+        (imu_mean, imu_std), (thm_mean, thm_std), (tof_mean, tof_std, tof_percentiles) = compute_modality_stats(train_ds, device=device)
+        np.save("./out/GruBil/imu_mean.npy", imu_mean)
+        np.save("./out/GruBil/imu_std.npy", imu_std)
+        np.save("./out/GruBil/thm_mean.npy", thm_mean)
+        np.save("./out/GruBil/thm_std.npy", thm_std)
+        np.save("./out/GruBil/tof_mean.npy", tof_mean)
+        np.save("./out/GruBil/tof_std.npy", tof_std)
+        np.save("./out/GruBil/tof_percentiles.npy", tof_percentiles)
     
     # 3) Rebuild Dataset with computed stats
-    train_ds = BFRBDataset(global_data, global_demo,
-                           imu_stats=(imu_mean, imu_std),
-                           thm_stats=(thm_mean, thm_std),
-                           tof_stats=(tof_mean, tof_std),
-                           is_train=True, bfrb_map=map, idx2bfrb=idx, target= target, gesture=gesture, ids = ids, indexes = indexes)
+    train_ds = BFRBDataset(
+        global_data, global_demo,
+        imu_stats=(imu_mean, imu_std),
+        thm_stats=(thm_mean, thm_std),
+        tof_stats=(tof_mean, tof_std),
+        tof_percentiles=tof_percentiles,  # Agregamos los percentiles de TOF aquí
+        is_train=True,
+        bfrb_map=map,
+        idx2bfrb=idx,
+        target=target,
+        gesture=gesture,
+        ids=ids,
+        indexes=indexes
+    )
 
 
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, collate_fn=collate_fn)
 
     # 4) Instantiate model
     if model is None:
-        model = BFRBClassifier(input_dim=37, num_bfrb_classes=len(map)).to(device)
+        model = BFRBClassifier(input_dim=52, num_bfrb_classes=len(map)).to(device)
     else:
         model = model.to(device)
     model.train()
@@ -126,7 +137,7 @@ def train_model(global_data: str, global_demo: str, train_csv: str, train_demo_c
         # Save best
         if avg_train < best_val_loss:
             best_val_loss = avg_train
-            torch.save(model.state_dict(), "./out/best_bfrb_model.pt")
+            torch.save(model.state_dict(), "./out/best_bfrb_model_GruBil.pt")
             print("  → saved new best model")
 
     print("Training complete. Best val loss:", best_val_loss)
@@ -142,12 +153,12 @@ if __name__ == "__main__":
     TRAIN_DEMO = "./data/train_demographics.csv"
     TEST_CSV = "./data/test.csv"
     TEST_DEMO = "./data/test_demographics.csv"
-    MODEL = "./out/best_bfrb_model.pt"
+    MODEL = "./out/best_bfrb_model_GruBil.pt"
     # Load model if exists
     model = None
     if Path(MODEL).exists():
         print("Loading existing model from:", MODEL)
-        model = BFRBClassifier(input_dim=37, num_bfrb_classes=18)  # Adjust num_bfrb_classes as needed
+        model = BFRBClassifier(input_dim=52, num_bfrb_classes=18)  # Adjust num_bfrb_classes as needed
         model.load_state_dict(torch.load(MODEL))
     else:
         print("No existing model found, training a new one.")

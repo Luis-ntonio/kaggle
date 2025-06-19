@@ -8,86 +8,104 @@ from torch.utils.data import DataLoader
 # 2) Utility functions for modality-specific preprocessing
 # =============================================================================
 
-def compute_tof_statistics(row: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+from typing import Tuple
+from torch.utils.data import DataLoader
+# =============================================================================
+# 2) Utility functions for modality-specific preprocessing
+# =============================================================================
+
+def compute_tof_statistics(row: pd.Series) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Given a single DataFrame row, compute per-ToF-sensor (mean, max, min) 
-    ignoring -1 (no signal). Also return a mask array of shape (5,) 
-    =1 if sensor had any valid pixel, else=0.
+    Given a single DataFrame row, compute per-ToF-sensor (mean, max, min) ignoring -1 (no signal).
+    Also return a mask array of shape (5,) =1 if sensor had any valid pixel, else=0.
+    Additionally, return the 25th, 50th, and 75th percentiles for each TOF sensor.
     """
     means = []
     maxs = []
     mins = []
+    percentiles_25th = []
+    percentiles_50th = []
+    percentiles_75th = []
     mask = []
+    
     for s in range(1, 6):  # sensors 1..5
         pixels = row[[f"tof_{s}_v{i}" for i in range(64)]].values.astype(np.float32)
-        # Identify valid pixels (pix >= 0)
-        valid = pixels >= 0
+        valid = pixels >= 0  # Identify valid pixels
+        
         if valid.sum() == 0:
-            # no valid return → mask=0, stats=0
             mask.append(0)
             means.append(0.0)
             maxs.append(0.0)
             mins.append(0.0)
+            percentiles_25th.append(0.0)
+            percentiles_50th.append(0.0)
+            percentiles_75th.append(0.0)
         else:
             mask.append(1)
             valid_pixels = pixels[valid]
             means.append(valid_pixels.mean())
             maxs.append(valid_pixels.max())
             mins.append(valid_pixels.min())
-    return np.array(means + maxs + mins, dtype=np.float32), np.array(mask, dtype=np.float32)
+            percentiles_25th.append(np.percentile(valid_pixels, 25))
+            percentiles_50th.append(np.percentile(valid_pixels, 50))
+            percentiles_75th.append(np.percentile(valid_pixels, 75))
+
+    # Return stats (mean, max, min) and percentiles (25th, 50th, 75th)
+    tof_stats = np.array(means + maxs + mins, dtype=np.float32)  # 15 dims
+    tof_percentiles = np.array(percentiles_25th + percentiles_50th + percentiles_75th, dtype=np.float32)  # 15 dims
+    return tof_stats, mask, tof_percentiles
 
 
 def preprocess_sequence_df(df_seq: pd.DataFrame,
                            imu_mean, imu_std,
                            thm_mean, thm_std,
-                           tof_agg_mean, tof_agg_std) -> Tuple[torch.Tensor, torch.Tensor]:
+                           tof_agg_mean, tof_agg_std, tof_percentiles) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    df_seq: a Pandas DataFrame slice for one sequence_id (all T rows).
-    imu_mean, imu_std: either (np.ndarray of shape (7,), np.ndarray of shape (7,)) or (None, None)
-    thm_mean, thm_std: either (np.ndarray(5,), np.ndarray(5,)) or (None, None)
-    tof_agg_mean, tof_agg_std: either (np.ndarray(15,), np.ndarray(15,)) or (None, None)
-
-    Returns:
-      X: torch.FloatTensor (T, 37)
-      length_mask: torch.FloatTensor (T,) all ones
+    Preprocess the sequence dataframe to produce input features for the model.
     """
-
     rows = []
     for _, row in df_seq.iterrows():
         # 1) IMU: acc_x, acc_y, acc_z, rot_w, rot_x, rot_y, rot_z → 7 dims
         imu_vals = row[["acc_x", "acc_y", "acc_z", "rot_w", "rot_x", "rot_y", "rot_z"]].values.astype(np.float32)
         imu_vals = np.nan_to_num(imu_vals, nan=0.0)
-        # ONLY normalize if stats are provided
         if (imu_mean is not None) and (imu_std is not None):
             imu_vals = (imu_vals - imu_mean) / (imu_std + 1e-6)
 
         # 2) Thermopile: thm_1..thm_5 → 5 dims + mask
-        thm    = row[["thm_1", "thm_2", "thm_3", "thm_4", "thm_5"]].values.astype(np.float32)
-        thm_mask = (~np.isnan(thm)).astype(np.float32)   # 1 if real sensor reading, 0 if NaN
+        thm = row[["thm_1", "thm_2", "thm_3", "thm_4", "thm_5"]].values.astype(np.float32)
+        thm_mask = (~np.isnan(thm)).astype(np.float32)  # 1 if real sensor reading, 0 if NaN
         thm = np.nan_to_num(thm, nan=0.0)
         if (thm_mean is not None) and (thm_std is not None):
             thm = (thm - thm_mean) / (thm_std + 1e-6)
 
-        # 3) ToF aggregates: (mean, max, min) over each 8×8 → 15 dims + 5‐dim mask
-        tof_stats, tof_mask = compute_tof_statistics(row)  # returns np.array(15,), np.array(5,)
+        # 3) ToF aggregates: (mean, max, min) over each 8x8 → 15 dims
+        tof_stats, tof_mask, tof_percentiles = compute_tof_statistics(row)
         tof_stats = np.nan_to_num(tof_stats, nan=0.0, posinf=0.0, neginf=0.0)
         if (tof_agg_mean is not None) and (tof_agg_std is not None):
             tof_stats = (tof_stats - tof_agg_mean) / (tof_agg_std + 1e-6)
 
-        # 4) Concatenate features into a 37‐dim vector
+        # 4) Concatenate features into a 45‐dim vector (added percentiles)
+        # Adding percentiles for each TOF sensor (25th, 50th, 75th percentiles)
         feat = np.concatenate([
             imu_vals,        # 7 dims
             thm,             # 5 dims
             thm_mask,        # 5 dims
-            tof_stats,       # 15 dims
-            tof_mask         # 5 dims
+            tof_stats,       # 15 dims (mean, max, min)
+            tof_mask,        # 5 dims
+            tof_percentiles  # 15 dims for percentiles
         ]).astype(np.float32)
         feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
         rows.append(feat)
 
-    X = np.stack(rows, axis=0)  # shape (T, 37)
+    X = np.stack(rows, axis=0)  # shape (T, 45)
     length_mask = np.ones((X.shape[0],), dtype=np.float32)
     return torch.from_numpy(X), torch.from_numpy(length_mask)
+
+
 
 
 def compute_modality_stats(dataset, device="cpu") -> Tuple[
@@ -125,6 +143,7 @@ def compute_modality_stats(dataset, device="cpu") -> Tuple[
     count_imu = torch.tensor(0.0,      device=device)  # scalar
     count_thm = torch.zeros(5, device=device)          # one count per thermopile channel
     count_tof = torch.zeros(15, device=device)         # one count per aggregated ToF channel
+
 
     loader = DataLoader(dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
 
@@ -200,4 +219,14 @@ def compute_modality_stats(dataset, device="cpu") -> Tuple[
     tof_agg_mean = tof_mean_t.cpu().numpy()      # shape (15,)
     tof_agg_std  = tof_std_t.cpu().numpy()       # shape (15,)
 
-    return (imu_mean, imu_std), (thm_mean, thm_std), (tof_agg_mean, tof_agg_std)
+    tof_percentiles_25th = torch.quantile(tof_stats, 0.25, dim=0)
+    tof_percentiles_50th = torch.quantile(tof_stats, 0.50, dim=0)
+    tof_percentiles_75th = torch.quantile(tof_stats, 0.75, dim=0)
+    
+    tof_percentiles = {
+        "25th": tof_percentiles_25th.cpu().numpy(),
+        "50th": tof_percentiles_50th.cpu().numpy(),
+        "75th": tof_percentiles_75th.cpu().numpy(),
+    }
+
+    return (imu_mean, imu_std), (thm_mean, thm_std), (tof_agg_mean, tof_agg_std, tof_percentiles)

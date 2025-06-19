@@ -16,7 +16,9 @@ class BFRBDataset(Dataset):
                  imu_stats: Tuple[np.ndarray, np.ndarray] = None,
                  thm_stats: Tuple[np.ndarray, np.ndarray] = None,
                  tof_stats: Tuple[np.ndarray, np.ndarray] = None,
-                 is_train: bool = True, global_stats: bool = False, bfrb_map: map = None, idx2bfrb =None, target=None, gesture=None, ids=None, indexes=None):
+                 is_train: bool = True, global_stats: bool = False, 
+                 bfrb_map: map = None, idx2bfrb =None, target=None, 
+                 gesture=None, ids=None, indexes=None, tof_percentiles=None):
         """
         csv_path: ruta a train.csv o test.csv
         demo_path: ruta a train_demographics.csv o test_demographics.csv
@@ -54,6 +56,7 @@ class BFRBDataset(Dataset):
         #    Además, preparamos idx2bfrb (índice→nombre de gesto) para poder reconstruirlo después.
         self.bfrb_map = bfrb_map if bfrb_map else {}
         self.idx2bfrb = idx2bfrb if idx2bfrb else []
+        self.tof_percentiles = tof_percentiles if tof_percentiles else {}
         self.is_target_list = []
         self.gesture_id_list = []
         self.seq_ids = []
@@ -123,45 +126,47 @@ class BFRBDataset(Dataset):
     def __getitem__(self, idx: int):
         """
         Devuelve un diccionario con:
-          - 'sequence_id': int                                <--- añadido
-          - 'features':     torch.Tensor (T, 37)
-          - 'length_mask':  torch.Tensor (T,)
-          - 'is_target':    int (0/1)     [solo si is_train=True]
-          - 'gesture_id':   int (0..7 o -1)[solo si is_train=True]
+        - 'sequence_id': int                                <--- añadido
+        - 'features':     torch.Tensor (T, 37)
+        - 'length_mask':  torch.Tensor (T,)
+        - 'is_target':    int (0/1)     [solo si is_train=True]
+        - 'gesture_id':   int (0..7 o -1)[solo si is_train=True]
         """
         seq_id = self.seq_ids[idx]
         indices = self.group_indices[idx]
         df_seq = self.df.iloc[indices].reset_index(drop=True)
 
-        # 1) Preprocesamos las filas de esta secuencia → (X, length_mask)
+        # Preprocesamos las filas de esta secuencia → (X, length_mask)
         X, len_mask = preprocess_sequence_df(
             df_seq,
-            imu_mean     = self.imu_mean,
-            imu_std      = self.imu_std,
-            thm_mean     = self.thm_mean,
-            thm_std      = self.thm_std,
-            tof_agg_mean = self.tof_agg_mean,
-            tof_agg_std  = self.tof_agg_std
+            imu_mean=self.imu_mean,
+            imu_std=self.imu_std,
+            thm_mean=self.thm_mean,
+            thm_std=self.thm_std,
+            tof_agg_mean=self.tof_agg_mean,
+            tof_agg_std=self.tof_agg_std,
+            tof_percentiles=self.tof_percentiles  # Asegúrate de pasar los percentiles aquí
         )
 
         demo_row = df_seq.iloc[0][["adult_child", "age", "sex",
-                                   "handedness", "height_cm",
-                                   "shoulder_to_wrist_cm",
-                                   "elbow_to_wrist_cm"]].values.astype(np.float32)
-        
+                                "handedness", "height_cm",
+                                "shoulder_to_wrist_cm",
+                                "elbow_to_wrist_cm"]].values.astype(np.float32)
+
         demo_feat = torch.tensor(demo_row, dtype=torch.float32)  # shape (7,)
 
         output = {
-            "features":     X,          # Tensor (T, 37)
-            "length_mask":  len_mask,    # Tensor (T,)
-            "demo_feat":   demo_feat   # (7,)
+            "features": X,  # Tensor (T, 37)
+            "length_mask": len_mask,  # Tensor (T,)
+            "demo_feat": demo_feat  # (7,)
         }
 
         if self.is_train:
             output["sequence_id"] = seq_id  # sequence_id is text, keep as string
-            output["is_target"]  = torch.tensor(self.is_target_list[idx], dtype=torch.float32)
+            output["is_target"] = torch.tensor(self.is_target_list[idx], dtype=torch.float32)
             output["gesture_id"] = torch.tensor(self.gesture_id_list[idx], dtype=torch.long)
         return output
+
 
 
 def collate_fn(batch: List[dict]):
